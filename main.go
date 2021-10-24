@@ -27,6 +27,7 @@ var (
 	vendorRegex    = regexp.MustCompile(`^ID="?(.*)"?$`)
 	nameRegex      = regexp.MustCompile(`^NAME="?(.*)"?$`)
 	versionIDRegex = regexp.MustCompile(`^VERSION_ID="?(.*)"?$`)
+	processRegex   = regexp.MustCompile(`\s?(\S+)\s?`)
 )
 
 type Config struct {
@@ -41,10 +42,19 @@ type ServerInformation struct {
 }
 
 type HostInformation struct {
-	HostAddr string `json:"host_addr"`
-	Name     string `json:"name,omitempty"`
-	Vendor   string `json:"vendor,omitempty"`
-	Version  string `json:"version,omitempty"`
+	HostAddr  string                `json:"host_addr"`
+	Name      string                `json:"name,omitempty"`
+	Vendor    string                `json:"vendor,omitempty"`
+	Version   string                `json:"version,omitempty"`
+	Processes []*ProcessInformation `json:"processes,omitempty"`
+}
+
+type ProcessInformation struct {
+	User    string `json:"user"`
+	Pid     string `json:"pid"`
+	CPU     string `json:"cpu"`
+	MEM     string `json:"mem"`
+	Command string `json:"command"`
 }
 
 func DialWithKey(addr string, user string, keyfile string, password string) (*ssh.Client, error) {
@@ -112,10 +122,8 @@ func getConfigFile(filename string) (Config, error) {
 }
 
 func collectData(addr string, user string, keyfile string, password string) (*HostInformation, error) {
-	var session *ssh.Session
-	var client *ssh.Client
-	var matches []string
 	var osInfo = &HostInformation{}
+	var client *ssh.Client
 	var err error
 
 	if len(keyfile) == 0 {
@@ -136,20 +144,27 @@ func collectData(addr string, user string, keyfile string, password string) (*Ho
 
 	defer client.Close()
 
-	session, err = client.NewSession()
+	err = parseOSInfo(client, osInfo)
 	if err != nil {
 		return nil, err
 	}
 
-	defer session.Close()
-
-	var buffer = bytes.NewBuffer(nil)
-
-	session.Stdout = buffer
-
-	err = session.Run("cat /etc/os-release")
+	err = parseProcessList(client, osInfo)
 	if err != nil {
 		return nil, err
+	}
+
+	return osInfo, nil
+}
+
+func parseOSInfo(client *ssh.Client, osInfo *HostInformation) error {
+	var buffer *bytes.Buffer
+	var matches []string
+	var err error
+
+	buffer, err = runCommand(client, "cat /etc/os-release")
+	if err != nil {
+		return err
 	}
 
 	s := bufio.NewScanner(buffer)
@@ -173,7 +188,62 @@ func collectData(addr string, user string, keyfile string, password string) (*Ho
 		}
 	}
 
-	return osInfo, nil
+	return nil
+}
+
+func parseProcessList(client *ssh.Client, osInfo *HostInformation) error {
+	var buffer *bytes.Buffer
+	var err error
+
+	buffer, err = runCommand(client, "ps aux")
+	if err != nil {
+		return err
+	}
+
+	var data = strings.Split(buffer.String(), "\n")
+
+	for _, line := range data {
+		var colData = processRegex.FindAllStringSubmatch(line, -1)
+
+		if len(colData) == 0 {
+			continue
+		}
+
+		if len(colData) >= 11 && !strings.HasPrefix(colData[10][1], "[") && colData[1][1] != "PID" {
+			osInfo.Processes = append(osInfo.Processes, &ProcessInformation{
+				User:    colData[0][1],
+				Pid:     colData[1][1],
+				CPU:     colData[2][1],
+				MEM:     colData[3][1],
+				Command: colData[10][1],
+			})
+		}
+	}
+
+	return nil
+}
+
+func runCommand(client *ssh.Client, command string) (*bytes.Buffer, error) {
+	var session *ssh.Session
+	var err error
+
+	session, err = client.NewSession()
+	if err != nil {
+		return nil, err
+	}
+
+	defer session.Close()
+
+	var buffer = bytes.NewBuffer(nil)
+
+	session.Stdout = buffer
+
+	err = session.Run(command)
+	if err != nil {
+		return nil, err
+	}
+
+	return buffer, nil
 }
 
 func main() {
@@ -216,9 +286,11 @@ func main() {
 	}
 
 	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader([]string{"Host", "OS Name", "OS Vendor", "OS Version"})
+	table.SetHeader([]string{"Host", "OS Name", "OS Vendor", "OS Version", "Process User", "Process ID", "Process CPU", "Process MEM", "Process Command"})
 	for _, osInfo := range allData {
-		table.Append([]string{osInfo.HostAddr, osInfo.Name, osInfo.Vendor, osInfo.Version})
+		for _, process := range osInfo.Processes {
+			table.Append([]string{osInfo.HostAddr, osInfo.Name, osInfo.Vendor, osInfo.Version, process.User, process.Pid, process.CPU, process.MEM, process.Command})
+		}
 	}
 	table.Render()
 }
