@@ -3,10 +3,10 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -17,24 +17,37 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-type OS struct {
-	Name    string `json:"name,omitempty"`
-	Vendor  string `json:"vendor,omitempty"`
-	Version string `json:"version,omitempty"`
-}
-
 var (
 	hostAddr   = flag.String("h", "", "host address")
 	user       = flag.String("u", "root", "username")
 	sshKeyPath = flag.String("i", "", "ssh key filename")
 	sshPass    = flag.String("p", "", "password")
+	configFile = flag.String("c", "", "config file")
 
 	vendorRegex    = regexp.MustCompile(`^ID="?(.*)"?$`)
 	nameRegex      = regexp.MustCompile(`^NAME="?(.*)"?$`)
 	versionIDRegex = regexp.MustCompile(`^VERSION_ID="?(.*)"?$`)
 )
 
-func DialWithKey(addr string, user string, keyfile string) (*ssh.Client, error) {
+type Config struct {
+	Servers []ServerInformation `json:"servers"`
+}
+
+type ServerInformation struct {
+	HostAddress string `json:"host_address"`
+	User        string `json:"user"`
+	SSHKeyPath  string `json:"ssh_key_path"`
+	SSHKeyPass  string `json:"ssh_key_pass"`
+}
+
+type HostInformation struct {
+	HostAddr string `json:"host_addr"`
+	Name     string `json:"name,omitempty"`
+	Vendor   string `json:"vendor,omitempty"`
+	Version  string `json:"version,omitempty"`
+}
+
+func DialWithKey(addr string, user string, keyfile string, password string) (*ssh.Client, error) {
 	var keyBytes []byte
 	var err error
 
@@ -45,9 +58,16 @@ func DialWithKey(addr string, user string, keyfile string) (*ssh.Client, error) 
 
 	var signer ssh.Signer
 
-	signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, []byte(*sshPass))
-	if err != nil {
-		return nil, err
+	if len(password) > 0 {
+		signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, []byte(password))
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		signer, err = ssh.ParsePrivateKey(keyBytes)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	config := &ssh.ClientConfig{
@@ -73,36 +93,52 @@ func DialWithKey(addr string, user string, keyfile string) (*ssh.Client, error) 
 	return client, nil
 }
 
-func main() {
-	var session *ssh.Session
-	var client *ssh.Client
+func getConfigFile(filename string) (Config, error) {
+	var config Config
+	var configBytes []byte
 	var err error
 
-	flag.Parse()
+	configBytes, err = ioutil.ReadFile(filename)
+	if err != nil {
+		return Config{}, err
+	}
 
-	if len(*sshKeyPath) == 0 {
+	err = json.Unmarshal(configBytes, &config)
+	if err != nil {
+		return Config{}, err
+	}
+
+	return config, nil
+}
+
+func collectData(addr string, user string, keyfile string, password string) (*HostInformation, error) {
+	var session *ssh.Session
+	var client *ssh.Client
+	var matches []string
+	var osInfo = &HostInformation{}
+	var err error
+
+	if len(keyfile) == 0 {
 		var temp string
 
 		temp, err = os.UserHomeDir()
 		if err != nil {
-			fmt.Println(err)
-			return
+			return nil, err
 		}
 
-		*sshKeyPath = filepath.Join(temp, ".ssh/id_rsa")
+		keyfile = filepath.Join(temp, ".ssh/id_rsa")
 	}
 
-	client, err = DialWithKey(*hostAddr, *user, *sshKeyPath)
+	client, err = DialWithKey(addr, user, keyfile, password)
 	if err != nil {
-		fmt.Println(err)
-		return
+		return nil, err
 	}
 
 	defer client.Close()
 
 	session, err = client.NewSession()
 	if err != nil {
-		return
+		return nil, err
 	}
 
 	defer session.Close()
@@ -113,18 +149,11 @@ func main() {
 
 	err = session.Run("cat /etc/os-release")
 	if err != nil {
-		return
+		return nil, err
 	}
-
-	log.Println(buffer.String())
-
-	var matches []string
-	var osInfo OS
 
 	s := bufio.NewScanner(buffer)
 	for s.Scan() {
-		log.Println(s.Text())
-
 		matches = versionIDRegex.FindStringSubmatch(s.Text())
 		if len(matches) > 0 {
 			osInfo.Version = strings.Trim(matches[1], `"`)
@@ -144,8 +173,52 @@ func main() {
 		}
 	}
 
+	return osInfo, nil
+}
+
+func main() {
+	var allData []*HostInformation
+	var err error
+
+	flag.Parse()
+
+	if len(*configFile) > 0 {
+		var configInfo Config
+		var hostInfo *HostInformation
+
+		configInfo, err = getConfigFile(*configFile)
+		if err != nil {
+			fmt.Println(err.Error())
+			return
+		}
+
+		for _, serverInfo := range configInfo.Servers {
+			hostInfo, err = collectData(serverInfo.HostAddress, serverInfo.User, serverInfo.SSHKeyPath, serverInfo.SSHKeyPass)
+			if err != nil {
+				fmt.Println(err.Error())
+			} else {
+				hostInfo.HostAddr = serverInfo.HostAddress
+				allData = append(allData, hostInfo)
+			}
+		}
+	} else {
+		var hostInfo *HostInformation
+
+		hostInfo, err = collectData(*hostAddr, *user, *sshKeyPath, *sshPass)
+		if err != nil {
+			fmt.Println(err.Error())
+			return
+		}
+
+		hostInfo.HostAddr = *hostAddr
+
+		allData = append(allData, hostInfo)
+	}
+
 	table := tablewriter.NewWriter(os.Stdout)
 	table.SetHeader([]string{"Host", "OS Name", "OS Vendor", "OS Version"})
-	table.Append([]string{*hostAddr, osInfo.Name, osInfo.Vendor, osInfo.Version})
+	for _, osInfo := range allData {
+		table.Append([]string{osInfo.HostAddr, osInfo.Name, osInfo.Vendor, osInfo.Version})
+	}
 	table.Render()
 }
