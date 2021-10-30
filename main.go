@@ -28,6 +28,7 @@ var (
 	sshPass        = flag.String("p", "", "password")
 	configFile     = flag.String("c", "", "config file")
 	interactive    = flag.Bool("it", false, "interactive terminal")
+	updateTime     = flag.Duration("d", 1*time.Minute, "how often to update the results (only with interactive terminal)")
 	vendorRegex    = regexp.MustCompile(`^ID="?(.*)"?$`)
 	nameRegex      = regexp.MustCompile(`^NAME="?(.*)"?$`)
 	versionIDRegex = regexp.MustCompile(`^VERSION_ID="?(.*)"?$`)
@@ -72,6 +73,7 @@ type UI struct {
 	uiEvents     chan UITermEvent
 	terminate    chan struct{}
 	done         chan struct{}
+	updateTime   time.Duration
 }
 
 type UITermEvent struct {
@@ -273,7 +275,7 @@ func runCommand(client *ssh.Client, command string) (*bytes.Buffer, error) {
 	return buffer, nil
 }
 
-func NewUI(tableRows []UITableRow) (*UI, error) {
+func NewUI(tableRows []UITableRow, updateTime time.Duration) (*UI, error) {
 	err := termbox.Init()
 	if err != nil {
 		return nil, err
@@ -293,10 +295,11 @@ func NewUI(tableRows []UITableRow) (*UI, error) {
 			"process-mem",
 			"process-command",
 		},
-		tableRows: tableRows,
-		uiEvents:  make(chan UITermEvent),
-		terminate: make(chan struct{}),
-		done:      make(chan struct{}),
+		tableRows:  tableRows,
+		uiEvents:   make(chan UITermEvent),
+		terminate:  make(chan struct{}),
+		done:       make(chan struct{}),
+		updateTime: updateTime,
 	}
 
 	u.selectables = nil
@@ -321,6 +324,9 @@ func (u *UI) Run(wg *sync.WaitGroup, sigMain chan os.Signal) {
 
 	go u.pollEvents()
 
+	periodicUpdateTicker := time.NewTicker(u.updateTime)
+	defer periodicUpdateTicker.Stop()
+
 	periodicRedrawTicker := time.NewTicker(2 * time.Second)
 	defer periodicRedrawTicker.Stop()
 
@@ -329,6 +335,30 @@ outer:
 		select {
 		case <-periodicRedrawTicker.C:
 			u.draw()
+			break
+		case <-periodicUpdateTicker.C:
+			var tableRows []UITableRow
+			var allData []*HostInformation
+			var err error
+
+			allData, err = collectAllData()
+			if err == nil {
+				for _, osInfo := range allData {
+					for _, process := range osInfo.Processes {
+						tableRows = append(tableRows, UITableRow{
+							id: osInfo.HostAddr + process.Pid,
+							cells: []string{
+								osInfo.HostAddr, osInfo.Name, osInfo.Vendor, osInfo.Version,
+								process.User, process.Pid, process.CPU, process.MEM, process.Command,
+							},
+						})
+					}
+				}
+
+				u.tableRows = tableRows
+				u.infoText = fmt.Sprintf("last update: %s",
+					time.Now().Format("Jan 2 15:04:05"))
+			}
 			break
 		case req := <-u.uiEvents:
 			switch req.event.Type {
@@ -617,11 +647,9 @@ func (u *UI) drawScrollbar(vertical bool, fixedCoord int, start int, screenSize 
 	}
 }
 
-func main() {
+func collectAllData() ([]*HostInformation, error) {
 	var allData []*HostInformation
 	var err error
-
-	flag.Parse()
 
 	if len(*configFile) > 0 {
 		var configInfo Config
@@ -629,15 +657,12 @@ func main() {
 
 		configInfo, err = getConfigFile(*configFile)
 		if err != nil {
-			fmt.Println(err.Error())
-			return
+			return nil, err
 		}
 
 		for _, serverInfo := range configInfo.Servers {
 			hostInfo, err = collectData(serverInfo.HostAddress, serverInfo.User, serverInfo.SSHKeyPath, serverInfo.SSHKeyPass)
-			if err != nil {
-				fmt.Println(err.Error())
-			} else {
+			if err == nil {
 				hostInfo.HostAddr = serverInfo.HostAddress
 				allData = append(allData, hostInfo)
 			}
@@ -647,13 +672,27 @@ func main() {
 
 		hostInfo, err = collectData(*hostAddr, *user, *sshKeyPath, *sshPass)
 		if err != nil {
-			fmt.Println(err.Error())
-			return
+			return nil, err
 		}
 
 		hostInfo.HostAddr = *hostAddr
 
 		allData = append(allData, hostInfo)
+	}
+
+	return allData, nil
+}
+
+func main() {
+	var allData []*HostInformation
+	var err error
+
+	flag.Parse()
+
+	allData, err = collectAllData()
+	if err != nil {
+		fmt.Println(err.Error())
+		return
 	}
 
 	if *interactive {
@@ -677,7 +716,7 @@ func main() {
 			}
 		}
 
-		collectorUI, err = NewUI(tableRows)
+		collectorUI, err = NewUI(tableRows, *updateTime)
 		if err == nil {
 			wg.Add(1)
 			go collectorUI.Run(&wg, sigMain)
